@@ -3,8 +3,8 @@
 This is not model training. A terminated episode becomes a short record of where
 Mario died, which jump led there, and which buttons were held. Later decisions
 include that record from before the fatal takeoff. A repeated high jump is cut
-short. The fatal button is replaced near the death only when an enemy is not
-already touching Mario.
+short. The fatal button is replaced near the death. A brake that already dodged
+an enemy is kept; the later walk back into that enemy is the action replaced.
 """
 
 import json
@@ -19,6 +19,7 @@ LAUNCH_AFTER_COMMIT_PX = 96
 SHORT_JUMP_PX = 64
 HEIGHT_CAP_PX = 32
 RECENT_DECISIONS = 48
+FAILED_STEPS = 5
 
 WITHOUT_JUMP = {
     "right_run_jump": "right_run",
@@ -26,6 +27,9 @@ WITHOUT_JUMP = {
     "left_jump": "left",
     "jump": "wait",
 }
+
+TOWARD_ACTIONS = frozenset({"right", "right_run", "right_jump", "right_run_jump"})
+AWAY_ACTIONS = frozenset({"left", "left_jump", "wait"})
 
 ALTERNATIVES = {
     "right_run_jump": ("right_run", "right_jump", "right"),
@@ -149,16 +153,154 @@ def find_commit(decisions):
     return chosen or fallback
 
 
+def threat_dx(state):
+    """Nearest same-height enemy still in front of Mario, in pixels."""
+    best = None
+    for obj in (state or {}).get("nearby_objects") or []:
+        if obj.get("kind") == "flagpole" or obj.get("defeated"):
+            continue
+        dx = obj.get("dx")
+        if dx is None or dx < 0:
+            continue
+        dy = obj.get("dy")
+        if dy is not None and abs(dy) >= 24:
+            continue
+        if best is None or dx < best:
+            best = int(dx)
+    return best
+
+
+def _points(decisions):
+    points = []
+    for decision in decisions:
+        mario = _mario(decision)
+        if mario.get("x") is None:
+            continue
+        points.append(
+            (
+                int(mario["x"]),
+                decision.get("action"),
+                threat_dx(decision.get("state")),
+            )
+        )
+    return points
+
+
+def retreat_cut(points):
+    """Where Mario turned back into an enemy after getting past it.
+
+    The returned index is the first step toward that enemy after the furthest
+    x. Earlier steps include the dodge and are worth replaying.
+    """
+    if len(points) < 2:
+        return None
+    peak = max(range(len(points)), key=lambda index: points[index][0])
+    if points[peak][0] - points[-1][0] < 16:
+        return None
+    for index in range(peak + 1, len(points)):
+        _x, action, dx = points[index]
+        if dx is not None and action in TOWARD_ACTIONS:
+            dodge = "left"
+            for earlier in range(index - 1, -1, -1):
+                if points[earlier][1] in AWAY_ACTIONS:
+                    dodge = points[earlier][1]
+                    break
+            return {
+                "index": index,
+                "reach_x": points[peak][0],
+                "return_action": action,
+                "dodge_action": dodge,
+            }
+    return None
+
+
+def closing_index(points):
+    """First step toward a new enemy after Mario had already passed one.
+
+    The passed enemy stays in the replay. The approach into the next enemy
+    does not, when that approach is what killed him. A straight death with no
+    passed enemy keeps the older 128-pixel margin.
+    """
+    if not points:
+        return None
+    last = points[-1][2]
+    if last is None or last > 32:
+        return None
+    previous = None
+    handoff = None
+    for index, (_x, _action, dx) in enumerate(points):
+        if dx is None:
+            continue
+        if previous is not None and previous <= 32 and dx >= previous + 16:
+            handoff = index
+        previous = dx
+    return handoff
+
+
+def failed_step_view(decision, outcome):
+    """One button press from the death, for Jev to compare with now."""
+    mario = _mario(decision)
+    result = decision.get("result") or {}
+    return {
+        "x": int(mario.get("x", 0)),
+        "y": int(mario.get("y", 0)),
+        "grounded": bool(mario.get("grounded")),
+        "action": decision.get("action"),
+        "hazard": hazard_from_state(decision.get("state") or {}),
+        "result_x": int(result.get("x", mario.get("x", 0))),
+        "result_y": int(result.get("y", mario.get("y", 0))),
+        "outcome": outcome,
+    }
+
+
+def failed_steps_from(decisions):
+    """The last five presses. The final one is the press that died."""
+    indexed = [item for item in decisions if _mario(item).get("x") is not None]
+    tail = indexed[-FAILED_STEPS:]
+    views = [
+        failed_step_view(item, "died" if item is tail[-1] else "approach")
+        for item in tail
+    ]
+    return views
+
+
 def lesson_from_episode(decisions):
     lesson = lesson_from_decision(
         decisions[-1], [decision.get("action") for decision in decisions]
     )
     lesson.update(find_commit(decisions))
-    if lesson["fall_height_px"] >= HIGH_FALL_PX:
+    points = _points(decisions)
+    if points:
+        lesson["reach_x"] = max(point[0] for point in points)
+    retreat = retreat_cut(points)
+    close = None if retreat else closing_index(points)
+    if retreat:
+        lesson["reach_x"] = retreat["reach_x"]
+        lesson["return_action"] = retreat["return_action"]
+        lesson["dodge_action"] = retreat["dodge_action"]
+        lesson["note"] = (
+            "A previous run dodged this enemy, then walked back into it. "
+            "Repeat the dodge. Do not turn around into the enemy."
+        )
+    elif close:
+        lesson["approach_x"] = points[close][0]
+        lesson["approach_action"] = points[close][1]
+        if points[close][1] in TOWARD_ACTIONS:
+            lesson["dodge_action"] = (
+                "left" if "jump" in points[close][1] else "right_jump"
+            )
+        lesson["note"] = (
+            "A previous run passed an enemy, then ran into the next one. "
+            "Do not repeat that approach."
+        )
+    elif lesson["fall_height_px"] >= HIGH_FALL_PX:
         lesson["note"] = (
             "A previous run jumped at commit_x and climbed fall_height_px, "
             "then fell into the hazard at death_x. Do not start or hold that jump."
         )
+    lesson["failed_steps"] = failed_steps_from(decisions)
+    if lesson["failed_steps"]:
+        lesson["failed_step"] = lesson["failed_steps"][-1]
     return lesson
 
 
@@ -210,7 +352,7 @@ def already_touching(state):
         if obj.get("kind") == "flagpole" or obj.get("defeated"):
             continue
         dx = obj.get("dx")
-        if dx is None or abs(dx) > 24:
+        if dx is None or dx < 0 or dx > 24:
             continue
         contact = obj.get("estimated_contact_in_frames")
         if contact is None or contact <= 2:
@@ -218,27 +360,80 @@ def already_touching(state):
     return False
 
 
+def _in_return(failure, x):
+    if x is None or not failure.get("return_action"):
+        return False
+    death = int(failure["death_x"])
+    reach = int(failure.get("reach_x", death))
+    low = min(death, reach) - REPEAT_PX
+    high = max(death, reach)
+    return low <= int(x) <= high
+
+
+def _avoid_recorded_steps(action, steps, x):
+    """Keep Jev's choice unless it is the failed press at this position."""
+    nearby = [
+        step for step in steps if abs(int(step.get("x", 0)) - int(x)) <= 16
+    ]
+    if not nearby:
+        return action, None
+    nearest = min(nearby, key=lambda step: abs(int(step.get("x", 0)) - int(x)))
+    if action != nearest.get("action"):
+        return action, None
+    banned = {step.get("action") for step in nearby}
+    stripped = WITHOUT_JUMP.get(action)
+    if stripped and stripped not in banned:
+        return stripped, action
+    for candidate in ALTERNATIVES.get(action, ()):
+        if candidate not in banned:
+            return candidate, action
+    return action, None
+
+
 def avoid_repeat(action, failures, state=None):
     """Replace a button press that already killed Mario within REPEAT_PX.
 
-    A repeated fatal button is still replaced when an enemy is already touching
-    Mario. Braking into that enemy is what the last level 1-2 deaths repeated,
-    so a forward jump is tried instead of another step left.
+    Leave the buttons alone when an enemy is already touching Mario. When the
+    last five failed presses are present, keep Jev's choice if it differs from
+    the press at this position. Only that repeated press is replaced.
     """
+    if already_touching(state):
+        return action, None
+    x = ((state or {}).get("mario") or {}).get("x")
+    steps = (state or {}).get("last_failed_steps") or []
+    if steps and x is not None:
+        return _avoid_recorded_steps(action, steps, x)
     if not failures:
         return action, None
+    for failure in failures:
+        dodge = failure.get("dodge_action")
+        if (
+            dodge
+            and action == failure.get("return_action")
+            and action != dodge
+            and _in_return(failure, x)
+        ):
+            return dodge, action
+        start = failure.get("approach_x")
+        if (
+            dodge
+            and start is not None
+            and x is not None
+            and int(start) - 8 <= int(x) <= int(failure["death_x"])
+            and action == failure.get("approach_action")
+            and action != dodge
+        ):
+            return dodge, action
     blocked = {
         failure["fatal_action"]
         for failure in failures
         if failure.get("fatal_action")
+        and failure.get("fatal_action") != failure.get("dodge_action")
         and failure.get("px_before_death", APPROACH_PX + 1) <= REPEAT_PX
     }
     if action not in blocked:
         return action, None
-    alternatives = ALTERNATIVES.get(action, ())
-    if already_touching(state) and action in {"left", "left_jump"}:
-        alternatives = ("right_run_jump", "jump", "right_run")
-    for candidate in alternatives:
+    for candidate in ALTERNATIVES.get(action, ()):
         if candidate not in blocked:
             return candidate, action
     return action, None
@@ -295,9 +490,24 @@ def correct_approach(action, state):
     }
 
 
+def reviewing_failure(state):
+    """True when the current position is inside the latest death's last steps."""
+    steps = state.get("last_failed_steps") or []
+    if not steps:
+        step = state.get("last_failed_step")
+        steps = [step] if step else []
+    x = (state.get("mario") or {}).get("x")
+    if not steps or x is None or any(step.get("x") is None for step in steps):
+        return False
+    start = min(int(step["x"]) for step in steps) - 4
+    end = max(int(step.get("result_x", step["x"])) for step in steps) + 32
+    return start <= int(x) <= end
+
+
 class FailureMemory:
     def __init__(self):
         self.lessons = []
+        self.last_failure = None
         self._recent = deque(maxlen=RECENT_DECISIONS)
 
     @classmethod
@@ -307,9 +517,14 @@ class FailureMemory:
         if not directory.exists():
             return memory
         collected = []
+        last = None
         for path in sorted(directory.glob("*.jsonl")):
-            collected.extend(lessons_in_log(path, env_id))
+            found = lessons_in_log(path, env_id)
+            if found:
+                last = found[-1]
+            collected.extend(found)
         memory.lessons = collapse(collected)
+        memory.last_failure = last
         return memory
 
     def note(self, decision):
@@ -332,6 +547,7 @@ class FailureMemory:
                 if lesson["fatal_action"] == fresh["fatal_action"]
                 and lesson["death_x"] // 32 == fresh["death_x"] // 32
             )
+            self.last_failure = fresh
         self._recent.clear()
         return learned
 
@@ -341,8 +557,9 @@ class FailureMemory:
         for lesson in self.lessons:
             death = int(lesson["death_x"])
             commit = int(lesson.get("commit_x", death))
+            reach = int(lesson.get("reach_x", death))
             start = min(death - APPROACH_PX, commit - COMMIT_LEAD_PX)
-            if start <= x <= death:
+            if start <= x <= max(death, reach):
                 nearby.append(
                     {
                         **lesson,
@@ -357,4 +574,13 @@ class FailureMemory:
         lessons = self.for_position(state["mario"]["x"])
         if lessons:
             state["prior_failures"] = lessons
+        last = self.last_failure
+        steps = (last or {}).get("failed_steps") or []
+        if steps and any(
+            lesson.get("death_x") == last.get("death_x")
+            and lesson.get("fatal_action") == last.get("fatal_action")
+            for lesson in lessons
+        ):
+            state["last_failed_steps"] = steps
+            state["last_failed_step"] = steps[-1]
         return state

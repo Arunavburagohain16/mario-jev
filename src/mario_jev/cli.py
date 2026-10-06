@@ -9,7 +9,7 @@ from time import perf_counter
 
 from dotenv import load_dotenv
 
-from .failures import FailureMemory
+from .failures import FailureMemory, reviewing_failure
 from .history import ObservationMemory
 from .policy import ACTIONS, JevPolicy, ScriptedPolicy
 from .qlearn import QTable
@@ -187,7 +187,11 @@ def main():
                         memory.observe(env.unwrapped.ram, info, args.frames)
                     )
                     started = perf_counter()
-                    cached = qtable.choose(state) if args.policy == "jev" else None
+                    cached = (
+                        None
+                        if args.policy != "jev" or reviewing_failure(state)
+                        else qtable.choose(state)
+                    )
                     if cached is None:
                         action, diagnostics = policy.choose(state)
                     else:

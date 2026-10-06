@@ -16,6 +16,10 @@ ACTIONS = {
 }
 
 _FAILURE = (
+    " If last_failed_steps is present, those are the last five button presses before"
+    " the latest death, in order. The last entry died. Find the entry whose x is"
+    " closest to the current x and do not repeat that entry's action. Choose a"
+    " different movement or jump so Mario does not die the same way."
     " If prior_failures is present and fall_height_px is high, the death began with"
     " commit_action at commit_x, climbed that many pixels, then fell into hazard at"
     " death_x. Do not start or hold that jump. Stay lower and jump only from the"

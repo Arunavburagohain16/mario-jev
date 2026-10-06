@@ -108,6 +108,47 @@ def test_logs_bootstrap_the_passing_run(tmp_path):
     assert (tmp_path / "qtable.json").exists()
 
 
+def _koopa(x, dx, previous="right"):
+    state = observed(x)
+    state["previous_action"] = previous
+    state["nearby_objects"] = [
+        {"kind": "green_koopa", "dx": dx, "dy": 8, "defeated": False}
+    ]
+    return state
+
+
+def test_a_dodge_is_replayed_and_the_walk_back_is_not():
+    table = QTable()
+    table.note(_koopa(844, 65), "right_run", 852, 176, True, False)
+    landed = _koopa(868, 34, previous="left_jump")
+    landed["jump_already_held"] = True
+    table.note(landed, "left", 877, 176, True, False)
+    table.note(_koopa(883, 12, previous="left"), "left", 881, 176, True, False)
+    turned = _koopa(842, 33, previous="left")
+    table.note(turned, "right", 836, 176, True, False)
+    table.note(_koopa(837, 15, previous="right"), "right", 846, 176, True, False)
+    table.finish_episode(883, "terminated")
+    assert table.frontier == 883
+    assert table.choose(landed)[0] == "left"
+    assert table.choose(turned) is None
+
+
+def test_the_next_enemy_after_a_dodge_is_not_replayed():
+    table = QTable()
+    table.note(
+        _koopa(875, 24, previous="right_run"), "left_jump", 885, 171, False, True
+    )
+    table.note(_koopa(893, 4, previous="left_jump"), "left_jump", 899, 166, False, True)
+    landing = _koopa(899, 50, previous="left_jump")
+    table.note(landing, "right", 903, 176, True, False)
+    table.note(_koopa(903, 44, previous="right"), "right_jump", 910, 162, False, True)
+    table.note(_koopa(968, 16, previous="right"), "left", 973, 176, True, False)
+    table.finish_episode(973, "terminated")
+    assert table.frontier == 893
+    assert table.choose(_koopa(893, 4, previous="left_jump"))[0] == "left_jump"
+    assert table.choose(landing) is None
+
+
 def test_levels_do_not_share_a_frontier(tmp_path):
     finished = {
         "type": "decision",

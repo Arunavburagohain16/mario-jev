@@ -1,13 +1,15 @@
 """Tabular Q-learning over exact positions a run has already passed.
 
 Jev is not called again for a discretized state at or before the frontier. The
-frontier is the furthest x reached, minus a margin when the episode died there.
-A later run that gets farther replaces the actions along the path it took.
+frontier is the furthest x reached. A death leaves out the walk back into the
+enemy, and otherwise the last 128 pixels. A later run that gets farther
+replaces the actions along the path it took.
 """
 
 import json
 from pathlib import Path
 
+from .failures import closing_index, retreat_cut, threat_dx
 from .policy import ACTIONS
 
 CLEARANCE = 128
@@ -15,7 +17,7 @@ ALPHA = 0.5
 GAMMA = 0.9
 COMPLETE_BONUS = 100
 BIN = 1
-VERSION = 4
+VERSION = 6
 DEFAULT_ENV = "SuperMarioBros-1-1-v0"
 TABLE_NAME = "qtable.json"
 
@@ -45,6 +47,30 @@ def safe_limit(max_x, stop_reason):
     if stop_reason in {"completed", "decision_limit", "window_closed", "truncated"}:
         return int(max_x)
     return None
+
+
+def passage(steps, max_x, stop_reason):
+    """Steps worth replaying, and the frontier they establish.
+
+    A death that dodged and then walked back keeps the dodge. After Mario
+    passes an enemy, the approach into the next one is left out when he dies
+    there. Other deaths keep the ground before the last 128 pixels.
+    """
+    completed = stop_reason == "completed"
+    if stop_reason != "terminated":
+        limit = safe_limit(max_x, stop_reason)
+        if limit is None:
+            return [], None, False
+        return steps, limit, completed
+    points = [(step.x, step.action, step.threat_dx) for step in steps]
+    retreat = retreat_cut(points)
+    index = retreat["index"] if retreat else closing_index(points)
+    if index is None or index <= 0:
+        return steps, int(max_x) - CLEARANCE, False
+    kept = steps[:index]
+    if not kept:
+        return [], None, False
+    return kept, max(step.x for step in kept), False
 
 
 class QTable:
@@ -143,18 +169,19 @@ class QTable:
                         int(after.get("y", result.get("y", mario["y"]))),
                         after.get("grounded", False),
                         "jump" in record["action"],
+                        threat_dx(state),
                     )
                 )
             elif record.get("type") == "summary":
                 episode_steps = steps.pop(episode, [])
-                limit = safe_limit(record.get("max_x", 0), record.get("stop_reason"))
+                kept, limit, completed = passage(
+                    episode_steps,
+                    record.get("max_x", 0),
+                    record.get("stop_reason"),
+                )
                 if limit is None:
                     continue
-                self.learn(
-                    episode_steps,
-                    limit,
-                    record.get("stop_reason") == "completed",
-                )
+                self.learn(kept, limit, completed)
 
     def begin_episode(self):
         self._steps = []
@@ -174,13 +201,14 @@ class QTable:
                 int(next_y),
                 bool(next_grounded),
                 bool(next_held),
+                threat_dx(state),
             )
         )
 
     def finish_episode(self, max_x, stop_reason):
-        limit = safe_limit(max_x, stop_reason)
+        kept, limit, completed = passage(self._steps, max_x, stop_reason)
         if limit is not None:
-            self.learn(self._steps, limit, stop_reason == "completed")
+            self.learn(kept, limit, completed)
         self._steps = []
         self.save()
 
@@ -233,19 +261,23 @@ class QTable:
 
 
 class _Step:
-    def __init__(self, key, action, x, dx, next_key):
+    def __init__(self, key, action, x, dx, next_key, threat_dx=None):
         self.key = key
         self.action = action
         self.x = x
         self.dx = dx
         self.next_key = next_key
+        self.threat_dx = threat_dx
 
 
-def _step(key, action, x, next_x, next_y, next_grounded, next_held=False):
+def _step(
+    key, action, x, next_x, next_y, next_grounded, next_held=False, threat_dx=None
+):
     return _Step(
         key,
         action,
         x,
         int(next_x) - int(x),
         state_key(next_x, next_y, next_grounded, next_held, action),
+        threat_dx,
     )
